@@ -1,7 +1,7 @@
 """
 Content-based course recommender: ranks a course catalog against a
 free-text learner profile, with optional exclusion of completed courses
-and optional level-awareness.
+optional level-awareness, and one optional adjacent exploration pick.
 """
 
 import numpy as np
@@ -184,6 +184,74 @@ def build_recommender(raw_df, skills_weight=0.6, content_weight=0.4):
     }
 
 
+def pick_adjacent_candidate(
+    live_catalog,
+    skills_sim,
+    content_sim,
+    exclude_indices=(),
+    skills_percentile=75,
+    content_percentile=60,
+    level_multipliers=None,
+):
+    """Choose one adjacent course by its level-adjusted skills/content gap.
+
+    Inputs are POSITIONAL arrays aligned with live_catalog, after filtering
+    completed courses. Return an integer positional index, or None.
+    """
+    skills_sim = np.asarray(skills_sim, dtype=float)
+    content_sim = np.asarray(content_sim, dtype=float)
+
+    if (
+        skills_sim.ndim != 1
+        or content_sim.ndim != 1
+        or len(skills_sim) != len(live_catalog)
+        or len(content_sim) != len(live_catalog)
+    ):
+        raise ValueError("Similarity arrays must align with live_catalog.")
+    if not 0 <= skills_percentile <= 100:
+        raise ValueError("skills_percentile must be between 0 and 100.")
+    if not 0 <= content_percentile <= 100:
+        raise ValueError("content_percentile must be between 0 and 100.")
+
+    if level_multipliers is None:
+        multipliers = np.ones(len(live_catalog), dtype=float)
+    else:
+        multipliers = np.asarray(level_multipliers, dtype=float)
+        if multipliers.shape != skills_sim.shape:
+            raise ValueError("Level multipliers must align with live_catalog.")
+        if not np.all(np.isfinite(multipliers)) or np.any(multipliers <= 0):
+            raise ValueError("Level multipliers must be finite and positive.")
+
+    valid = np.isfinite(skills_sim) & np.isfinite(content_sim)
+    if not valid.any():
+        return None
+
+    skills_threshold = np.percentile(skills_sim[valid], skills_percentile)
+    content_threshold = np.percentile(content_sim[valid], content_percentile)
+
+    eligible = (
+        valid
+        & (skills_sim >= skills_threshold)
+        & (content_sim >= content_threshold)
+        & (skills_sim > content_sim)
+        & (skills_sim > 0)
+        & (content_sim > 0)
+    )
+
+    for index in exclude_indices:
+        if not isinstance(index, (int, np.integer)) or not 0 <= index < len(eligible):
+            raise ValueError("exclude_indices must contain valid positional indices.")
+        eligible[index] = False
+
+    candidate_indices = np.flatnonzero(eligible)
+    if candidate_indices.size == 0:
+        return None
+
+    exploration_scores = (skills_sim - content_sim) * multipliers
+    best_index = candidate_indices[np.argmax(exploration_scores[candidate_indices])]
+    return int(best_index)
+
+
 def recommend(
     recommender,
     profile_text,
@@ -192,8 +260,16 @@ def recommend(
     n=5,
     stretch_bonus=0.15,
     retreat_penalty=0.15,
+    include_adjacent=False,
 ):
-    """Return top-n relevant eligible courses, optionally level-adjusted."""
+    """Return top-n eligible courses, optionally reserving one adjacent slot.
+
+    Standard recommendations are ranked by level-adjusted combined similarity.
+    The optional adjacent pick is selected by level-adjusted skills/content gap.
+    If no adjacent candidate qualifies, fall back to n standard picks.
+    For n=1, return the highest-ranked standard course even when
+    include_adjacent=True. Output columns have a consistent schema.
+    """
     if not isinstance(profile_text, str) or not profile_text.strip():
         raise ValueError("profile_text must be a non-empty string.")
     if isinstance(n, bool) or not isinstance(n, (int, np.integer)) or n < 1:
@@ -206,29 +282,44 @@ def recommend(
     if skills_vec.nnz == 0 and content_vec.nnz == 0:
         raise ValueError("Profile has no terms recognized by either vectorizer.")
 
-    skills_sim = cosine_similarity(
-        skills_vec, recommender["skills_matrix"]
-    ).ravel()
-    content_sim = cosine_similarity(
-        content_vec, recommender["content_matrix"]
-    ).ravel()
+    skills_sim = cosine_similarity(skills_vec, recommender["skills_matrix"]).ravel()
+    content_sim = cosine_similarity(content_vec, recommender["content_matrix"]).ravel()
     combined_scores = (
         recommender["skills_weight"] * skills_sim
         + recommender["content_weight"] * content_sim
     )
 
+    # Filter every similarity signal using identical title/organization exclusions.
     live_catalog = catalog
-    live_scores = combined_scores
+    base_scores = combined_scores
+    live_skills_sim = skills_sim
+    live_content_sim = content_sim
     unmatched_exclusions = []
 
     if exclude_titles is not None:
         filtered = filter_excluded(catalog, combined_scores, exclude_titles)
         live_catalog = filtered["catalog"]
-        live_scores = filtered["scores"]
+        base_scores = filtered["scores"]
         unmatched_exclusions = filtered["unmatched_exclusions"]
+        live_skills_sim = filter_excluded(catalog, skills_sim, exclude_titles)["scores"]
+        live_content_sim = filter_excluded(catalog, content_sim, exclude_titles)["scores"]
 
-    # Similarity scores stay available for interpreting the level adjustment.
-    base_scores = live_scores.copy()
+    # Check positional alignment without changing either similarity metric.
+    if not (
+        len(live_catalog)
+        == len(base_scores)
+        == len(live_skills_sim)
+        == len(live_content_sim)
+    ):
+        raise ValueError("Filtered catalog and similarity arrays are misaligned.")
+
+    reconstructed_scores = (
+        recommender["skills_weight"] * live_skills_sim
+        + recommender["content_weight"] * live_content_sim
+    )
+    if not np.allclose(reconstructed_scores, base_scores):
+        raise ValueError("Filtered similarity scores do not reconstruct base scores.")
+
     level_multipliers = np.ones(len(live_catalog), dtype=float)
     if learner_level is not None:
         gaps = compute_level_gaps(live_catalog, learner_level)
@@ -237,12 +328,42 @@ def recommend(
         )
     adjusted_scores = base_scores * level_multipliers
 
-    top_indices = np.argsort(adjusted_scores)[::-1][:n]
+    ranked_indices = np.argsort(adjusted_scores)[::-1]
+    adjacent_index = None
+
+    if include_adjacent and n >= 2 and len(ranked_indices) > 0:
+        main_indices = ranked_indices[: n - 1].tolist()
+        adjacent_index = pick_adjacent_candidate(
+            live_catalog=live_catalog,
+            skills_sim=live_skills_sim,
+            content_sim=live_content_sim,
+            exclude_indices=set(main_indices),
+            skills_percentile=75,
+            content_percentile=60,
+            level_multipliers=level_multipliers,
+        )
+        if adjacent_index is not None:
+            top_indices = main_indices + [adjacent_index]
+        else:
+            top_indices = ranked_indices[:n].tolist()
+    else:
+        top_indices = ranked_indices[:n].tolist()
+
     results = live_catalog.iloc[top_indices][
         ["title", "Organization", "Level"]
     ].copy().reset_index(drop=True)
     results["similarity_score"] = base_scores[top_indices]
     results["level_multiplier"] = level_multipliers[top_indices]
     results["score"] = adjusted_scores[top_indices]
+    results["is_adjacent_pick"] = [
+        adjacent_index is not None and i == adjacent_index for i in top_indices
+    ]
+    results["exploration_score"] = np.nan
+    if adjacent_index is not None:
+        results.loc[results["is_adjacent_pick"], "exploration_score"] = (
+            (live_skills_sim[adjacent_index] - live_content_sim[adjacent_index])
+            * level_multipliers[adjacent_index]
+        )
+
     results.attrs["unmatched_exclusions"] = unmatched_exclusions
     return results
